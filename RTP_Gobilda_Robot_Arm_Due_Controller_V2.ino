@@ -34,11 +34,19 @@
     joint6 - Gobilda 2000 Torque      (Actuator)      0.5ms - 2.5ms
   */
 
-//Libraries
+//Libraries & Pre-requisites
   #include <Wire.h>
   #include <Adafruit_PWMServoDriver.h>
   #include <Adafruit_MPU6050.h>
   #include <avr/pgmspace.h>
+
+  #include <array> 
+  using namespace std;
+   
+  #ifndef ARDUINO_SAM_DUE
+    #warning Sketch is designed for Arduino DUE (SAM3x) board. Not tested on AVR memory architecture.
+    // Assumes Due memory architecture (string literals and constants intended to be in Flash memory)  
+  #endif 
 //Constants
   const int8_t pwmPort [6] =                  {   1,   2,   3,   4,   5,   6}; //Define PCA9685 port for each joint
   // Define the configuration space of the robot arm.  WARNING: Workspace will be more limited (most commonly by a tabletop)
@@ -53,11 +61,11 @@
   // Joint speeds and wait times
   const int16_t servoRotationSpeed[6] =  { 200,2100, 200, 200, 200, 200}; //For each joint, microseconds per ROTATION_SPEED_DEGREES of servo travel (including any gearing) from servo datasheet
   const int16_t startWait[6] =           { 250,5000, 250, 250, 250, 250}; //Wait time for joint to achieve start position
-  const unsigned long diagWait = 10000; //Wait time between publishing diagnostics (milliseconds)
+  const unsigned long diagWait = 30000; //Wait time between publishing diagnostics (milliseconds)
 
 //Enumerations and Types
   enum jointIndex { // more easily reference indices of the configuration matrices by joint number
-    joint1, 
+    joint1,         // n.b., joint index equals joint number -1
     joint2, 
     joint3, 
     joint4, 
@@ -81,8 +89,9 @@
   jointStateType jointState[6] = {joint_Idle,joint_Idle,joint_Idle,joint_Idle,joint_Idle,joint_Idle};
   armStateType armState = arm_Idle; 
   diagStateType diagState = diag_Waiting;
+  int16_t nextPose[6] ; //Queued next position the arm will move to after targetPose is reached
   int16_t targetPose[6] ; //Position the arm is moving to, composed of 6 joint angles
-  int16_t nextStepPose[6] ; //The next step the arm is moving to on the path to jointTargetPose
+  int16_t nextStepPose[6] ; //The next step the arm is moving to on the path to TargetPose
   int16_t lastPose[6]; //Last position of arm
   unsigned long lastPoseTime; //Time in milliseconds that the arm's lastPose was reached
   float stepWait[6]; //Time to wait (milliseconds) for a joint to move one tick (/4095) of rotation. This is calculated from servoRotationSpeed in calcJointStepWait()
@@ -93,7 +102,11 @@
   sensors_event_t gyro;
   sensors_event_t temp;  
   static bool do_echo = true;
-
+  // Test of Array use for recorded Poses
+ 
+  array<array<int16_t, 6>, 1> recordedPose = {
+    { 300, 300, 300, 300, 300, 300} // Standing Straight up
+  };
 //Compiler constants
   #define RTP_DEBUG true //Comment out to turn off debug mode
   //#define ROS_IO true.    //comment out to select Serial Monitor IO. define to select ROS IO
@@ -101,6 +114,7 @@
   #define SERVO_FREQ 50 // PWM Pulse frequency in Hz 
   #define SET_FREQ_WAIT 10 // Wait time for setPWMFreq function to complete
   #define ROTATION_SPEED_DEGREES 60 // Number of degrees of travel for servoRotationSpeed calculations
+  //###TODO Should step size be a variable which can be adjusted from CMD line?
   #define STEP_SIZE 1 // Number of ticks per servo movement step
   #define BUF_LENGTH 128  // Buffer for the incoming command. 
 
@@ -109,7 +123,7 @@
   Adafruit_MPU6050 mpu; // on Wire1 ref. mpu.begin()
   Adafruit_Sensor *mpu_temp, *mpu_accel, *mpu_gyro;
 
-void setup() {
+void setup() { 
   setupArduinoDue();
   #ifdef ROS_IO
     setupROS();
@@ -131,27 +145,27 @@ void loop() {
   publishDiagnostics();
 } 
 
-void setupArduinoDue() {
+void setupArduinoDue() { 
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);  
   currentTime = millis();
   prevDiagTime = currentTime;
 }
 
-void setupROS() {
+void setupROS() { // Setup for Robot Operating System (ROS) IO
     //###TODO
 }
 
-void setupSerialMonitor() {
+void setupSerialMonitor() { // Setup for Serial IO
   Serial.begin(115200); 
   while (!Serial)
     delay(10); 
-  Serial.println(F(
+  Serial.println(
     "+-----------------------------------------------+\r\n"
     "| RTP Gobilda Robot Arm Due PCA9685 Controller  |\r\n"
     "+-----------------------------------------------+\r\n"
     " NOTE: Serial Monitor must be set to CR only\r\n"
-  ));
+  );
 }
 
 void setupPCA9685 () {
@@ -189,8 +203,8 @@ void setupMPU6050() {
   }
 }
 
-void checkConfigSymmetry() {
-  //###TODO - warning messages during ROS IO
+void checkConfigSymmetry() { //Check balance of config so mapping algorithms work
+  //###TODO - warning messages during ROS IO (search whole sketch)
   #ifdef RTP_DEBUG
     //Serial.println("checkConfigSymmetry()");
   #endif
@@ -206,7 +220,7 @@ void checkConfigSymmetry() {
   }
 }
 
-void setStartPose() {
+void setStartPose() { // Set start pose and initialise pose variables
   // Move each joint individually to the vertical initial pose
   // Would prefer to move slowly, but problem is we do not know the starting point, so cant use step technique.
   // NB blocking code 
@@ -215,15 +229,17 @@ void setStartPose() {
   #endif
   for (int8_t i = joint1; i <= joint6; i++) { 
     targetPose[i] = jointCentre[i];
-    lastPose [i] = targetPose [i];
-    nextStepPose [i] = targetPose [i];
+    lastPose[i] = targetPose[i];
+    nextStepPose[i] = targetPose[i];
+    nextPose[i] = targetPose[i];
     setJoint(i,targetPose[i]);
     delay(startWait[i]);
   }
+  //printPose("recordedPose",recordedPose[1]);  //DEBUG ###TODO trying to get array structure working row by row.
   //delay(max(max(max(max(max(startWait[joint1],startWait[joint2]),startWait[joint3]),startWait[joint4]),startWait[joint5]),startWait[joint6]));
 }
 
-void setJoint(int8_t joint, int16_t pulseEnd) {
+void setJoint(int8_t joint, int16_t pulseEnd) { //Output the PWM signal for the selected Joint
   // Set a joint to a rotation using PWM servo signal   
   #ifdef RTP_DEBUG
     Serial.print("setJoint(");
@@ -234,19 +250,6 @@ void setJoint(int8_t joint, int16_t pulseEnd) {
   #endif
   pwm.setPWM(pwmPort[joint],0,pulseEnd);
 }
- 
-/*
-void setPose(int16_t pose[6]) {
-  // Move to arm pose immediately, no stepping.
-  // WARNING - not recommended, causes sudden movement of arm. 
-  #ifdef RTP_DEBUG
-    Serial.println("setPose()");
-  #endif
-  for (int8_t i = joint1; i <= joint6; i++) {
-    setJoint(i,pose[i]);
-  }
-}
-*/
 
 void printPose(char label[12], int16_t pose[6]) {
   #ifdef RTP_DEBUG
@@ -344,7 +347,8 @@ void updateJointState(int8_t joint) {
 }
 
 void publishDiagnostics() {
-  switch (diagState) {
+  currentTime = millis(); // Recheck time. This function can be called any time by checkInput(). Without this publishDiagnostics() gets run twice after command.
+    switch (diagState) {
     case diag_Waiting:
       if (currentTime - prevDiagTime >= diagWait) {
         diagState = diag_Publishing;
@@ -355,6 +359,7 @@ void publishDiagnostics() {
         Serial.print("currentTime ");
         Serial.print(currentTime);
         Serial.println(" publishDiagnostics()");
+        printPose("nextPose    ",nextPose);
         printPose("targetPose  ",targetPose);
         printPose("nextStepPose",nextStepPose);
         printPose("lastPose    ",lastPose);
@@ -369,9 +374,6 @@ void publishDiagnostics() {
         //###TODO Publish interval might be too slow for useful MPU data. Averaging?
         printMPU();
         Serial.println(" ");
-        //###TODO
-        //  Queued Pose
-        //  Last Command Received
       #endif
       prevDiagTime = millis();
       diagState = diag_Waiting;
@@ -379,7 +381,7 @@ void publishDiagnostics() {
   }
 }
 
-void printMPU() {
+void printMPU() { // Print all MPU6050 readings
   mpu_temp->getEvent(&temp);
   mpu_accel->getEvent(&accel);
   mpu_gyro->getEvent(&gyro);
@@ -406,7 +408,7 @@ void printMPU() {
   //Serial.println();
 }
 
-void checkInput() {
+void checkInput() { //Check for command input
   #ifdef RTP_DEBUG
     //Serial.println("checkInput()");
   #endif
@@ -439,41 +441,65 @@ void checkInput() {
   }
 }
 
-
-static void exec(char *cmdline) /* Execute a complete command. */
-{
-    char *command = strsep(&cmdline, " ");
-
-    if (strcmp_P(command, PSTR("help")) == 0) {
-        Serial.println(F(
-            "mode <pin> <mode>: pinMode()\r\n"
-            "read <pin>: digitalRead()\r\n"
-            "aread <pin>: analogRead()\r\n"
-            "write <pin> <value>: digitalWrite()\r\n"
-            "awrite <pin> <value>: analogWrite()\r\n"
-            "echo <value>: set echo off (0) or on (1)"));
-    } else if (strcmp_P(command, PSTR("mode")) == 0) {
-        int pin = atoi(strsep(&cmdline, " "));
-        int mode = atoi(cmdline);
-        //pinMode(pin, mode);
-    } else if (strcmp_P(command, PSTR("read")) == 0) {
-        int pin = atoi(cmdline);
-        //Serial.println(digitalRead(pin));
-    } else if (strcmp_P(command, PSTR("aread")) == 0) {
-        int pin = atoi(cmdline);
-        //Serial.println(analogRead(pin));
-    } else if (strcmp_P(command, PSTR("write")) == 0) {
-        int pin = atoi(strsep(&cmdline, " "));
-        int value = atoi(cmdline);
-        //digitalWrite(pin, value);
-    } else if (strcmp_P(command, PSTR("awrite")) == 0) {
-        int pin = atoi(strsep(&cmdline, " "));
-        int value = atoi(cmdline);
-        //analogWrite(pin, value);
-    } else if (strcmp_P(command, PSTR("echo")) == 0) {
-        do_echo = atoi(cmdline);
-    } else {
-        Serial.print(F("Error: Unknown command: "));
-        Serial.println(command);
+static void exec(char *cmdline) {/* Execute a command. */
+  //###TODO New comands for: poseDegrees; jointDegrees
+  char *command = strsep(&cmdline, " ");
+  if (strcmp(command, "help") == 0) {
+    Serial.println(
+      "+------------------------------------------+\r\n"
+      "| help                                     |\r\n"
+      "|                                          |\r\n"
+      "| pose <j1>,<j2>,<j3>,<j4>,<j5>,<j6>       |\r\n"
+      "|    - set each joint angle in ticks       |\r\n"
+      "| joint <joint>,<ticks>                    |\r\n"
+      "|    - set one joint angle in ticks        |\r\n"
+      "| diagnose                                 |\r\n"
+      "|    - force print diagnostics             |\r\n"
+      "| [cartesian <x>,<y>,<z>]                  |\r\n"
+      "|    - set x,y,z, pose. not yet impl       |\r\n"
+      "| echo <value>                             |\r\n"
+      "|    - set echo off (0) or on (1)          |\r\n"
+      "+------------------------------------------+\r\n"
+    );
+  } else if (strcmp(command, "pose") == 0) {                  // Pose ***
+    for (int8_t i = joint1; i <= joint6; i++) { 
+      int16_t ticks = atoi(strsep(&cmdline, ","));
+      setNextJoint(i,ticks);
     }
+    #ifdef RTP_DEBUG
+      printPose("nextPose  ",nextPose);           
+    #endif
+    //###TODO update state machines.
+  } else if (strcmp(command, "joint") == 0) {                 //Joint ***
+    int8_t joint = atoi(strsep(&cmdline, ","))-1;  
+    int8_t ticks = atoi(cmdline);
+    setNextJoint(joint,ticks);
+    //###TODO What if the arm is already moving to a pose? Do the other joint targets remain as before?
+    //###TODO What if the arm and this joint is already moving, and this command requires a change in direction?
+    //###TODO update state machines.
+  } else if (strcmp(command, "diagnose") == 0) {              //Diagnose ***
+    diagState = diag_Publishing;
+    publishDiagnostics();
+  } else if (strcmp(command, "cartesian") == 0) {             //Cartesian ***
+    int x = atoi(strsep(&cmdline, ","));
+    int y = atoi(strsep(&cmdline, ","));
+    int z = atoi(cmdline);
+    Serial.print("  WARNING: cartesion command not yet implemented.");
+  } else if (strcmp(command, "echo") == 0) {                  //Echo ***
+    do_echo = atoi(cmdline);
+  } else {
+    Serial.print("Error: Unknown command: ");
+    Serial.println(command);
+  }
+}
+
+void setNextJoint (int16_t joint, int16_t ticks) { // Update a single joint in the next pose queued
+  if ((ticks <= jointMax[joint]) && (ticks >=jointMin[joint])) {
+    nextPose[joint] = ticks;
+  } else {
+    Serial.print("  ERROR: Joint setting out of bounds. Joint");
+    Serial.print(joint+1);
+    Serial.print(", ");
+    Serial.println(ticks);
+  }
 }
